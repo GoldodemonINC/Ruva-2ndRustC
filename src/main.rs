@@ -384,10 +384,15 @@ fn cmd_check(input: &Path, all: bool) -> Result<()> {
         // `--all` is documented as `ruva check src/ --all`, so the path is
         // usually the directory itself. Falling back to `parent()` first walked
         // the wrong directory and silently reported success with zero files.
+        // A bare filename has an empty parent, which is not a readable path;
+        // fall back to the current directory in that case.
         let dir = if input.is_dir() {
             input
         } else {
-            input.parent().unwrap_or(input)
+            match input.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            }
         };
         let mut checked = 0;
         let mut failed = 0;
