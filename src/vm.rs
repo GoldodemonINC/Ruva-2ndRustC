@@ -35,7 +35,10 @@ pub struct Object {
 pub struct VmFunction {
     pub name: String,
     pub arity: usize,
-    pub chunk: Chunk,
+    // Shared, so a call does not deep-copy the whole bytecode chunk. Every
+    // function invocation used to clone code/lines/constants/strings before
+    // running, which dominated call overhead in tight loops.
+    pub chunk: Rc<Chunk>,
     pub max_locals: usize,
 }
 
@@ -108,6 +111,23 @@ impl Value {
     }
 }
 
+/// Applies the format spec from a `{...}` placeholder to an already-stringified
+/// value. Only precision is supported (`{:.2}`), which covers the common float
+/// case; any other spec prints the value unchanged rather than the spec text.
+fn apply_format_spec(value: &str, spec: Option<&str>) -> String {
+    let Some(spec) = spec else { return value.to_string() };
+    if let Some(precision) = spec.strip_prefix('.') {
+        if let Ok(precision) = precision.parse::<usize>() {
+            if precision <= 20 {
+                if let Ok(number) = value.trim().parse::<f64>() {
+                    return format!("{:.*}", precision, number);
+                }
+            }
+        }
+    }
+    value.to_string()
+}
+
 fn format_vm_string(fmt: &str, args: &[String]) -> String {
     let mut result = String::with_capacity(fmt.len());
     let mut chars = fmt.chars().peekable();
@@ -128,6 +148,20 @@ fn format_vm_string(fmt: &str, args: &[String]) -> String {
                             break;
                         }
                     }
+                    // Optional `:spec` section, e.g. `{:.2}` or `{0:.3}`.
+                    let mut spec: Option<String> = None;
+                    if chars.peek() == Some(&':') {
+                        chars.next();
+                        let mut s = String::new();
+                        while let Some(&ch) = chars.peek() {
+                            if ch == '}' {
+                                break;
+                            }
+                            s.push(ch);
+                            chars.next();
+                        }
+                        spec = Some(s);
+                    }
                     if chars.peek() == Some(&'}') {
                         chars.next();
                         let value = if num_str.is_empty() {
@@ -138,11 +172,15 @@ fn format_vm_string(fmt: &str, args: &[String]) -> String {
                             num_str.parse::<usize>().ok().and_then(|i| args.get(i).map(|s| s.as_str()))
                         };
                         if let Some(v) = value {
-                            result.push_str(v);
+                            result.push_str(&apply_format_spec(v, spec.as_deref()));
                         }
                     } else {
                         result.push('{');
                         result.push_str(&num_str);
+                        if let Some(s) = spec {
+                            result.push(':');
+                            result.push_str(&s);
+                        }
                     }
                 }
             }
@@ -432,7 +470,7 @@ impl Compiler {
             }
         }
         let func_obj = Rc::new(RefCell::new(VmFunction {
-            name: func.name.clone(), arity: func.params.len(), chunk: sub.chunk, max_locals: sub.max_locals,
+            name: func.name.clone(), arity: func.params.len(), chunk: Rc::new(sub.chunk), max_locals: sub.max_locals,
         }));
         let const_idx = self.chunk.add_constant(Value::Function(func_obj));
         self.chunk.emit_u16(Opcode::LoadConst, const_idx, func_line);
@@ -971,7 +1009,7 @@ impl Compiler {
 
         sub.chunk.emit_byte(Opcode::Return, line);
         let func_obj = Rc::new(RefCell::new(VmFunction {
-            name: "<closure>".into(), arity: params.len(), chunk: sub.chunk, max_locals: sub.max_locals,
+            name: "<closure>".into(), arity: params.len(), chunk: Rc::new(sub.chunk), max_locals: sub.max_locals,
         }));
         let const_idx = self.chunk.add_constant(Value::Function(func_obj));
         self.chunk.emit_u16(Opcode::LoadConst, const_idx, line);
@@ -1110,16 +1148,14 @@ pub struct Vm {
     env_stack: Vec<Rc<RefCell<Vec<Value>>>>,
     globals: HashMap<String, Value>,
     debug: bool,
-    current_chunk: Chunk,
 }
 
 impl Vm {
     pub fn new(debug: bool) -> Self {
-        Self { stack: Vec::with_capacity(512), frames: Vec::with_capacity(64), env_stack: Vec::new(), globals: HashMap::new(), debug, current_chunk: Chunk::new() }
+        Self { stack: Vec::with_capacity(512), frames: Vec::with_capacity(64), env_stack: Vec::new(), globals: HashMap::new(), debug }
     }
 
     pub fn run(&mut self, chunk: &Chunk) -> Result<Value, String> {
-        self.current_chunk = chunk.clone();
         self.frames.push(Frame { ip: 0, slot: 0 });
         self.run_loop(chunk)
     }
@@ -1474,3 +1510,36 @@ pub fn run_chunk(chunk: &Chunk, debug: bool) -> Result<Value, String> {
     vm.run(chunk)
 }
 
+
+#[cfg(test)]
+mod format_tests {
+    use super::format_vm_string;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn positional_and_implicit_placeholders() {
+        assert_eq!(format_vm_string("{} + {} = {}", &args(&["1", "2", "3"])), "1 + 2 = 3");
+        assert_eq!(format_vm_string("{1}-{0}", &args(&["a", "b"])), "b-a");
+    }
+
+    #[test]
+    fn precision_is_applied_to_numbers() {
+        assert_eq!(format_vm_string("{:.2}", &args(&["3.14159"])), "3.14");
+        assert_eq!(format_vm_string("area = {:.1}", &args(&["12.34"])), "area = 12.3");
+        assert_eq!(format_vm_string("{0:.3}", &args(&["2"])), "2.000");
+        assert_eq!(format_vm_string("{:.0}", &args(&["2.6"])), "3");
+    }
+
+    #[test]
+    fn precision_on_non_numbers_prints_value_unchanged() {
+        assert_eq!(format_vm_string("{:.2}", &args(&["hello"])), "hello");
+    }
+
+    #[test]
+    fn escaped_braces_are_literal() {
+        assert_eq!(format_vm_string("{{}}", &args(&[])), "{}");
+    }
+}

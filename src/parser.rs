@@ -2,6 +2,14 @@ use crate::ast::*;
 use crate::lexer::Lexer;
 use anyhow::{bail, Result};
 
+/// Maximum syntactic nesting depth for expressions and types.
+///
+/// The parser is recursive-descent, so hostile or generated input such as
+/// `((((...))))` would otherwise exhaust the host stack and abort the whole
+/// process. A 40 KB file of 20,000 nested parens used to take the compiler
+/// down; refusing the input with a normal diagnostic is the safe behaviour.
+const MAX_NESTING_DEPTH: u32 = 128;
+
 pub struct Parser {
     tokens: Vec<(Token, Span)>,
     pos: usize,
@@ -16,6 +24,15 @@ pub struct Parser {
 
 
     split_gt_pending: bool,
+
+    /// Current expression / type nesting depth, guarded by `MAX_NESTING_DEPTH`.
+    expr_depth: u32,
+    type_depth: u32,
+
+    /// Line of the most recently consumed token. `advance` overwrites consumed
+    /// tokens with a placeholder, so the token stream itself cannot answer
+    /// "did this token start a new line?".
+    last_consumed_line: usize,
 }
 
 impl Parser {
@@ -27,6 +44,9 @@ impl Parser {
             can_construct: true,
             split_gt_pending: false,
             last_expr_had_semicolon: false,
+            expr_depth: 0,
+            type_depth: 0,
+            last_consumed_line: 0,
         })
     }
 
@@ -41,6 +61,13 @@ impl Parser {
         self.tokens.get(self.pos).map(|(_, s)| *s).unwrap_or(Span { line: 0, col: 0 })
     }
 
+    /// True when the upcoming token starts a new source line relative to the
+    /// last token consumed. Used to decide whether a `(` or `[` continues the
+    /// current expression or begins a new statement.
+    fn starts_new_line(&self) -> bool {
+        self.last_consumed_line > 0 && self.peek_span().line != self.last_consumed_line
+    }
+
     fn advance(&mut self) -> (Token, Span) {
         if self.split_gt_pending {
             self.split_gt_pending = false;
@@ -51,6 +78,9 @@ impl Parser {
             let default = (Token::Eof, Span { line: 0, col: 0 });
             let result = std::mem::replace(&mut self.tokens[self.pos], default);
             self.pos += 1;
+            if result.1.line > 0 {
+                self.last_consumed_line = result.1.line;
+            }
             result
         } else {
             (Token::Eof, Span { line: 0, col: 0 })
@@ -965,6 +995,23 @@ impl Parser {
 
 
     fn parse_type(&mut self) -> Result<Type> {
+        self.type_depth += 1;
+        if self.type_depth > MAX_NESTING_DEPTH {
+            self.type_depth -= 1;
+            let span = self.peek_span();
+            bail!(
+                "Type nesting too deep (max {}) at {}:{}",
+                MAX_NESTING_DEPTH,
+                span.line,
+                span.col
+            );
+        }
+        let result = self.parse_type_inner();
+        self.type_depth -= 1;
+        result
+    }
+
+    fn parse_type_inner(&mut self) -> Result<Type> {
         let base = match self.peek() {
             Token::Star => {
 
@@ -1548,6 +1595,23 @@ impl Parser {
 
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr> {
+        self.expr_depth += 1;
+        if self.expr_depth > MAX_NESTING_DEPTH {
+            self.expr_depth -= 1;
+            let span = self.peek_span();
+            bail!(
+                "Expression nesting too deep (max {}) at {}:{}",
+                MAX_NESTING_DEPTH,
+                span.line,
+                span.col
+            );
+        }
+        let result = self.parse_expr_bp_inner(min_bp);
+        self.expr_depth -= 1;
+        result
+    }
+
+    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expr> {
         let mut lhs = self.parse_unary()?;
 
 
@@ -1672,7 +1736,10 @@ impl Parser {
                         };
                     }
                 }
-                Token::LBracket => {
+                // A `[` on its own line after a complete expression belongs to
+                // the next statement (`let s = 1.0` followed by `[s, s]`), not
+                // to an index of the previous one.
+                Token::LBracket if !self.starts_new_line() => {
                     self.advance();
                     let index = self.parse_expr()?;
                     self.expect(&Token::RBracket)?;
@@ -1705,7 +1772,13 @@ impl Parser {
                         fields,
                     };
                 }
-                Token::LParen => {
+                // A call's argument list has to open on the same line as the
+                // callee. Without this, any statement starting with `(` was
+                // swallowed by the previous expression:
+                //     let s = 1.0
+                //     (s * 2.0).sqrt()   // parsed as 1.0(s * 2.0).sqrt()
+                // which surfaced as a bogus "Variable 's' is not defined".
+                Token::LParen if !self.starts_new_line() => {
                     self.advance();
                     let args = self.parse_args()?;
                     self.expect(&Token::RParen)?;
@@ -2301,6 +2374,53 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A statement that begins with `(` must not be absorbed as a call on the
+    /// previous statement's expression. Before the fix, `let s = 1.0` followed
+    /// by `(s * 2.0).sqrt()` parsed as `1.0(s * 2.0).sqrt()`, which then failed
+    /// type checking with a bogus "Variable 's' is not defined".
+    #[test]
+    fn test_newline_prevents_paren_call_continuation() {
+        let src = "fn main() {\n    let s = 1.0\n    (s * 2.0).sqrt()\n}";
+        let mut parser = Parser::new(src).unwrap();
+        let program = parser.parse_program().unwrap();
+
+        let Item::Function(f) = &program.items[0] else { panic!("Expected function") };
+        assert_eq!(f.body.stmts.len(), 1, "the parenthesised expression is its own statement");
+        assert!(f.body.expr.is_some(), "it is the block's tail expression");
+
+        let Stmt::Let { value, .. } = &f.body.stmts[0] else { panic!("Expected let") };
+        assert!(
+            !matches!(value, Expr::Call { .. }),
+            "`let s = 1.0` must not turn into a call on 1.0, got {:?}",
+            value
+        );
+    }
+
+    /// Same rule for `[`: an index may not open on a new line.
+    #[test]
+    fn test_newline_prevents_bracket_index_continuation() {
+        let src = "fn main() {\n    let s = 1.0\n    [s, s]\n}";
+        let mut parser = Parser::new(src).unwrap();
+        let program = parser.parse_program().unwrap();
+
+        let Item::Function(f) = &program.items[0] else { panic!("Expected function") };
+        let Stmt::Let { value, .. } = &f.body.stmts[0] else { panic!("Expected let") };
+        assert!(!matches!(value, Expr::Index { .. }), "got {:?}", value);
+    }
+
+    /// Calls that legitimately span lines still parse as calls: the `(` opens on
+    /// the callee's line even though the arguments do not.
+    #[test]
+    fn test_multiline_call_still_parses() {
+        let src = "fn main() {\n    add(\n        1,\n        2,\n    )\n}";
+        let mut parser = Parser::new(src).unwrap();
+        let program = parser.parse_program().unwrap();
+
+        let Item::Function(f) = &program.items[0] else { panic!("Expected function") };
+        let expr = f.body.expr.as_ref().expect("tail expression");
+        assert!(matches!(&**expr, Expr::Call { .. }), "got {:?}", expr);
+    }
 
     #[test]
     fn test_parse_let() {

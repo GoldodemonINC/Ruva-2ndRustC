@@ -4,6 +4,8 @@
 *.rve  linguist-language=Ruva linguist-detectable
 
 # Exclude generated/snapshot files from language stats
-*.golden linguist-generated
+# Golden snapshots are compared byte-for-byte by the test harness, so pin them to
+# LF regardless of the platform's core.autocrlf setting.
+*.golden linguist-generated text eol=lf
 .github/ linguist-generated
 *.toml linguist-vendored

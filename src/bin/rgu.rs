@@ -81,8 +81,26 @@ fn cmd_build(input: &Path, target: Target, to_stdout: bool) -> Result<()> {
     Ok(())
 }
 
+/// Recursive-descent parsing needs a predictable stack budget; the platform
+/// default main-thread stack (~1 MB on Windows) is not enough for deep nesting.
+const COMPILER_STACK_SIZE: usize = 32 * 1024 * 1024;
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
+
+    let worker = std::thread::Builder::new()
+        .name("rgu-compiler".into())
+        .stack_size(COMPILER_STACK_SIZE)
+        .spawn(move || run(args))
+        .map_err(|e| anyhow::anyhow!("failed to start compiler thread: {e}"))?;
+
+    match worker.join() {
+        Ok(result) => result,
+        Err(_) => bail!("compiler thread panicked"),
+    }
+}
+
+fn run(args: Vec<String>) -> Result<()> {
     let mut it = args.iter().skip(1);
 
     let Some(sub) = it.next() else {

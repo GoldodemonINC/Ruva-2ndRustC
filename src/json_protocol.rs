@@ -332,8 +332,8 @@ mod tests {
     fn test_json_parse_number() {
         let val = json_parse("42").unwrap();
         assert_eq!(val, JsonValue::Number(42.0));
-        let val = json_parse("-3.14").unwrap();
-        assert_eq!(val, JsonValue::Number(-3.14));
+        let val = json_parse("-3.5").unwrap();
+        assert_eq!(val, JsonValue::Number(-3.5));
     }
 
     #[test]
@@ -426,7 +426,7 @@ mod tests {
         let s = json_stringify(&val);
         assert_eq!(s, "42");
 
-        let val = JsonValue::Number(3.14);
+        let val = JsonValue::Number(3.5);
         let s = json_stringify(&val);
         assert!(s.contains('.'));
     }
