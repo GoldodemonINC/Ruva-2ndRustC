@@ -14,6 +14,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 
+/// Golden snapshots are LF-only. A Windows checkout with `core.autocrlf=true`
+/// rewrites them to CRLF, which used to fail every snapshot test for a reason
+/// that had nothing to do with the compiler. Compare on normalized line endings.
+fn normalize_eol(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 const GOLDEN_CASES: &[&str] = &[
     "hello",
     "variables",
@@ -205,7 +212,7 @@ macro_rules! golden_test {
             let golden = golden_path(case);
             let bless = std::env::var("GOLDEN_BLESS").is_ok();
 
-            let actual = transpile_ruva_to_rust(&input);
+            let actual = normalize_eol(&transpile_ruva_to_rust(&input));
 
             if bless {
                 fs::write(&golden, &actual).expect("Failed to write golden file");
@@ -213,8 +220,10 @@ macro_rules! golden_test {
                 return;
             }
 
-            let expected = fs::read_to_string(&golden)
-                .unwrap_or_else(|e| panic!("Failed to read golden file {}: {}", golden.display(), e));
+            let expected = normalize_eol(
+                &fs::read_to_string(&golden)
+                    .unwrap_or_else(|e| panic!("Failed to read golden file {}: {}", golden.display(), e)),
+            );
 
             if actual != expected {
                 let diff = simple_diff(&expected, &actual);
@@ -305,7 +314,7 @@ macro_rules! syntax_error_test {
             let golden = error_golden_path(case);
             let bless = std::env::var("GOLDEN_BLESS").is_ok();
 
-            let actual = run_transpile_error(&input);
+            let actual = normalize_eol(&run_transpile_error(&input));
 
             if bless {
                 fs::write(&golden, &actual).expect("Failed to write error golden file");
@@ -313,8 +322,10 @@ macro_rules! syntax_error_test {
                 return;
             }
 
-            let expected = fs::read_to_string(&golden)
-                .unwrap_or_else(|e| panic!("Failed to read error golden file {}: {}", golden.display(), e));
+            let expected = normalize_eol(
+                &fs::read_to_string(&golden)
+                    .unwrap_or_else(|e| panic!("Failed to read error golden file {}: {}", golden.display(), e)),
+            );
 
             if actual != expected {
                 let diff = simple_diff(&expected, &actual);
@@ -340,7 +351,7 @@ macro_rules! type_error_test {
             let golden = error_golden_path(case);
             let bless = std::env::var("GOLDEN_BLESS").is_ok();
 
-            let actual = run_check_error(&input);
+            let actual = normalize_eol(&run_check_error(&input));
 
             if bless {
                 fs::write(&golden, &actual).expect("Failed to write error golden file");
@@ -348,8 +359,10 @@ macro_rules! type_error_test {
                 return;
             }
 
-            let expected = fs::read_to_string(&golden)
-                .unwrap_or_else(|e| panic!("Failed to read error golden file {}: {}", golden.display(), e));
+            let expected = normalize_eol(
+                &fs::read_to_string(&golden)
+                    .unwrap_or_else(|e| panic!("Failed to read error golden file {}: {}", golden.display(), e)),
+            );
 
             if actual != expected {
                 let diff = simple_diff(&expected, &actual);

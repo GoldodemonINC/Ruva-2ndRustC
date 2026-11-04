@@ -138,9 +138,29 @@ enum Commands {
     },
 }
 
+/// The front end is recursive-descent and the back end walks the AST
+/// recursively, so both are stack-hungry. The platform default main-thread
+/// stack is only ~1 MB on Windows, which made deeply nested (but legal) input
+/// abort the process. The parser's nesting guard rejects hostile input; this
+/// explicit budget keeps legitimate deep nesting from hitting the same wall.
+const COMPILER_STACK_SIZE: usize = 32 * 1024 * 1024;
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let worker = std::thread::Builder::new()
+        .name("ruva-compiler".into())
+        .stack_size(COMPILER_STACK_SIZE)
+        .spawn(move || run_cli(cli))
+        .map_err(|e| anyhow::anyhow!("failed to start compiler thread: {e}"))?;
+
+    match worker.join() {
+        Ok(result) => result,
+        Err(_) => bail!("compiler thread panicked"),
+    }
+}
+
+fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Compile { input, output, release, lazy, verbose } => {
             cmd_compile(&input, output.as_deref(), release, lazy, verbose)?;
@@ -295,7 +315,7 @@ fn cmd_build(project: &Path, release: bool) -> Result<()> {
     }
 
     if files.is_empty() {
-        bail!("No .ruva/.rv files found in {}", src_dir.display());
+        bail!("No .ruva/.rve files found in {}", src_dir.display());
     }
 
     eprintln!("⟳ Building {} .ruva files...", files.len());
@@ -361,22 +381,44 @@ fn cmd_run(input: &Path, args: &[String]) -> Result<()> {
 
 fn cmd_check(input: &Path, all: bool) -> Result<()> {
     if all {
-
-        let dir = input.parent().unwrap_or(input);
+        // `--all` is documented as `ruva check src/ --all`, so the path is
+        // usually the directory itself. Falling back to `parent()` first walked
+        // the wrong directory and silently reported success with zero files.
+        let dir = if input.is_dir() {
+            input
+        } else {
+            input.parent().unwrap_or(input)
+        };
+        let mut checked = 0;
+        let mut failed = 0;
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if is_ruva_source(&path) {
-                check_file(&path)?;
+                checked += 1;
+                // Keep going after a failing file so one bad file does not hide
+                // the diagnostics of every file that follows it.
+                if !check_file(&path)? {
+                    failed += 1;
+                }
             }
         }
-    } else {
-        check_file(input)?;
+        if checked == 0 {
+            bail!("No .ruva/.rve files found in {}", dir.display());
+        }
+        if failed > 0 {
+            eprintln!("{}", colors::error(&format!("{} of {} file(s) failed", failed, checked)));
+            std::process::exit(1);
+        }
+    } else if !check_file(input)? {
+        std::process::exit(1);
     }
     Ok(())
 }
 
-fn check_file(path: &Path) -> Result<()> {
+/// Checks a single file, reporting its diagnostics. Returns `Ok(true)` when the
+/// file is clean and `Ok(false)` when it has lexical, parse, or type errors.
+fn check_file(path: &Path) -> Result<bool> {
     let source = read_source(path)?;
     match parser::Parser::new(&source) {
         Ok(mut parser) => match parser.parse_program() {
@@ -404,18 +446,18 @@ fn check_file(path: &Path) -> Result<()> {
                     for err in &errors {
                         eprintln!("{}", colors::error(&err.to_string()));
                     }
-                    std::process::exit(1);
+                    return Ok(false);
                 }
-                Ok(())
+                Ok(true)
             }
             Err(e) => {
                 eprintln!("✗ Parse error in {}: {}", path.display(), e);
-                std::process::exit(1);
+                Ok(false)
             }
         },
         Err(e) => {
             eprintln!("✗ Lex error in {}: {}", path.display(), e);
-            std::process::exit(1);
+            Ok(false)
         }
     }
 }

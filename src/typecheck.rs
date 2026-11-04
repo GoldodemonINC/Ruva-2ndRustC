@@ -61,6 +61,10 @@ pub struct TypeChecker {
     type_var_values: std::collections::HashMap<usize, Option<Ty>>,
     /// Counter for generating fresh type variable IDs.
     next_type_var: usize,
+    /// Names introduced by `struct` / `class` / `enum` declarations. These are
+    /// also registered as bindings so name resolution sees them, but they are
+    /// types, so "never used" variable warnings must skip them.
+    type_names: std::collections::HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -107,14 +111,13 @@ impl TypeChecker {
             current_return_type: None,
             in_unsafe_block: false,
             in_unsafe_fn: false,
-            current_line: 0,
-            current_col: 0,
+            current_line: 0,            current_col: 0,
             warning_count: 0,
             error_count: 0,
             type_var_values: std::collections::HashMap::new(),
             next_type_var: 0,
+            type_names: std::collections::HashSet::new(),
         };
-
 
         for b in &["Some", "None", "Ok", "Err", "Self"] {
             checker.define_var(b.to_string(), Ty::Named(b.to_string()), false, 0);
@@ -173,6 +176,7 @@ impl TypeChecker {
                     (f.name.clone(), self.ast_type_to_ty(&f.ty))
                 }).collect();
                 self.struct_fields.insert(c.name.clone(), fields);
+                self.type_names.insert(c.name.clone());
                 self.define_var(c.name.clone(), Ty::Named(c.name.clone()), false, c.span.line);
 
                 for m in &c.methods {
@@ -188,9 +192,11 @@ impl TypeChecker {
                     (f.name.clone(), self.ast_type_to_ty(&f.ty))
                 }).collect();
                 self.struct_fields.insert(s.name.clone(), fields);
+                self.type_names.insert(s.name.clone());
                 self.define_var(s.name.clone(), Ty::Named(s.name.clone()), false, s.span.line);
             }
             Item::Enum(e) => {
+                self.type_names.insert(e.name.clone());
                 self.define_var(e.name.clone(), Ty::Named(e.name.clone()), false, e.span.line);
 
                 for v in &e.variants {
@@ -406,6 +412,13 @@ impl TypeChecker {
     }
 
     fn block_has_return(&self, block: &Block) -> bool {
+        // A block's tail expression is the block's value, unless it is
+        // side-effect-only (e.g. a trailing `println!`).
+        if let Some(ref tail) = block.expr {
+            if self.expr_yields_value(tail) {
+                return true;
+            }
+        }
         for stmt in &block.stmts {
             if matches!(stmt, Stmt::Return(Some(_))) {
                 return true;
@@ -417,8 +430,45 @@ impl TypeChecker {
                     }
                 }
             }
+            // `match` yields a value when every arm does, so a match that
+            // covers all cases returns the arm's value.
+            if let Stmt::Match { arms, .. } = stmt {
+                if !arms.is_empty() && arms.iter().all(|arm| self.expr_yields_value(&arm.body)) {
+                    return true;
+                }
+            }
+            // A `match` in statement position can also be wrapped in Expr.
+            if let Stmt::Expr(Expr::Match { arms, .. }) = stmt {
+                if !arms.is_empty() && arms.iter().all(|arm| self.expr_yields_value(&arm.body)) {
+                    return true;
+                }
+            }
         }
         false
+    }
+
+    /// Whether an expression produces a value (as opposed to only side effects).
+    /// Used for tail expressions and `match` arm bodies when deciding if a
+    /// function returns a value.
+    fn expr_yields_value(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Block(block) => match block.expr.as_ref() {
+                Some(tail) => self.expr_yields_value(tail),
+                None => self.block_has_return(block),
+            },
+            // `println!`-style macros and functions declared without a return
+            // type are unit-valued, so they do not satisfy a typed return.
+            Expr::Macro { .. } => false,
+            Expr::Call { function, .. } => match &**function {
+                Expr::Ident(name) => self
+                    .functions
+                    .get(name)
+                    .map(|sig| sig.return_type.as_ref().map_or(false, |t| !self.ty_is_unit(t)))
+                    .unwrap_or(true),
+                _ => true,
+            },
+            _ => true,
+        }
     }
 
     fn check_block(&mut self, block: &Block) {
@@ -1100,12 +1150,19 @@ impl TypeChecker {
                 }
             }
 
-            Expr::Closure { return_type, body, .. } => {
-                if let Some(rt) = return_type {
-                    self.ast_type_to_ty(rt)
-                } else {
-                    self.infer_type(body)
-                }
+            // A closure is a function value, not its return type. Typing it as
+            // the body's type made `apply(|x: i32| -> i32 { x * 2 }, 21)` fail
+            // with "has type 'i32', expected 'fn(i32) -> i32'".
+            Expr::Closure { params, return_type, body, .. } => {
+                let param_tys: Vec<Ty> = params
+                    .iter()
+                    .map(|p| p.ty.as_ref().map(|t| self.ast_type_to_ty(t)).unwrap_or(Ty::Inferred))
+                    .collect();
+                let ret = match return_type {
+                    Some(rt) => self.ast_type_to_ty(rt),
+                    None => self.infer_type(body),
+                };
+                Ty::FnPointer { params: param_tys, ret: Box::new(ret) }
             }
 
             Expr::Cast { ty, .. } => self.ast_type_to_ty(ty),
@@ -1330,6 +1387,25 @@ impl TypeChecker {
             || matches!(&b, Ty::Named(s) if s == "Result" || s.starts_with("Result::"));
         if a_is_result && b_is_result { return true; }
 
+        // Byte-string/string literal ergonomics: an owned string value (a string
+        // literal is typed `string`) is accepted where `&str` is expected, which
+        // is what `greet("World")` means for `fn greet(name: &str)`.
+        let is_str_ty = |t: &Ty| match t {
+            Ty::Primitive(s) | Ty::Named(s) => s == "str" || s == "String" || s == "string",
+            _ => false,
+        };
+        let is_owned_str = |t: &Ty| match t {
+            Ty::Primitive(s) | Ty::Named(s) => s == "string" || s == "String",
+            _ => false,
+        };
+        let is_str_ref = |t: &Ty| match t {
+            Ty::Reference(inner, _) => is_str_ty(inner),
+            _ => false,
+        };
+        if (is_owned_str(&a) && is_str_ref(&b)) || (is_str_ref(&a) && is_owned_str(&b)) {
+            return true;
+        }
+
         match (&a, &b) {
 
             (Ty::Primitive(a), Ty::Primitive(b)) => {
@@ -1515,7 +1591,14 @@ impl TypeChecker {
             .map(|scope| {
 
                 scope.bindings.iter()
-                    .filter(|(name, &(_, used, _))| !used && name.as_str() != "main" && !name.starts_with('_'))
+                    .filter(|(name, &(_, used, _))| {
+                        let nm = name.as_str();
+                        !used
+                            && nm != "main"
+                            && !nm.starts_with('_')
+                            && !self.type_names.contains(nm)
+                            && !["Some","None","Ok","Err","Self"].contains(&nm)
+                })
                     .map(|(name, _)| name.clone())
                     .collect()
             })
@@ -1731,7 +1814,7 @@ mod tests {
     fn test_type_inference_literals() {
         let mut checker = TypeChecker::new();
         assert_eq!(checker.infer_type(&Expr::Int(42)), Ty::Primitive("i64".into()));
-        assert_eq!(checker.infer_type(&Expr::Float(3.14)), Ty::Primitive("f64".into()));
+        assert_eq!(checker.infer_type(&Expr::Float(3.5)), Ty::Primitive("f64".into()));
         assert_eq!(checker.infer_type(&Expr::Str("hello".into())), Ty::Primitive("string".into()));
         assert_eq!(checker.infer_type(&Expr::Bool(true)), Ty::Primitive("bool".into()));
     }
@@ -2000,3 +2083,147 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod diagnostics_regression_tests {
+    use super::*;
+    use crate::parser::Parser;
+
+    fn check(source: &str) -> Vec<Diagnostic> {
+        let mut parser = Parser::new(source).unwrap();
+        let program = parser.parse_program().unwrap();
+        let mut checker = TypeChecker::new();
+        checker.check(&program)
+    }
+
+    fn messages(diags: &[Diagnostic], kind: DiagnosticKind) -> Vec<String> {
+        diags.iter().filter(|d| d.kind == kind).map(|d| d.message.clone()).collect()
+    }
+
+    #[test]
+    fn type_declaration_names_are_not_unused_variables() {
+        // struct/enum/class names are types; reporting them as unused variables
+        // was noise in every program that declared one.
+        let diags = check(r#"
+            struct Point { x: i32, y: i32 }
+            enum Direction { North, South }
+
+            fn main() {
+                let p = Point { x: 1, y: 2 }
+                println!("{}", p.x)
+            }
+        "#);
+        let unused: Vec<_> = messages(&diags, DiagnosticKind::Warning)
+            .into_iter()
+            .filter(|m| m.contains("is never used"))
+            .collect();
+        assert!(unused.is_empty(), "unexpected unused warnings: {:?}", unused);
+    }
+
+    #[test]
+    fn genuinely_unused_binding_still_warns() {
+        let diags = check(r#"
+            fn helper() -> i32 {
+                return 1
+            }
+
+            fn main() {
+                println!("hi")
+            }
+        "#);
+        let unused: Vec<_> = messages(&diags, DiagnosticKind::Warning)
+            .into_iter()
+            .filter(|m| m.contains("is never used"))
+            .collect();
+        assert_eq!(unused.len(), 1, "expected one warning, got {:?}", unused);
+        assert!(unused[0].contains("helper"));
+    }
+
+    #[test]
+    fn match_tail_expression_counts_as_return_value() {
+        let diags = check(r#"
+            fn f(x: i32) -> i32 {
+                match x {
+                    0 => 1,
+                    _ => 2,
+                }
+            }
+
+            fn main() {
+                println!("{}", f(0))
+            }
+        "#);
+        assert!(
+            !messages(&diags, DiagnosticKind::Warning).iter().any(|m| m.contains("may not return a value")),
+            "unexpected return warning: {:?}",
+            messages(&diags, DiagnosticKind::Warning)
+        );
+    }
+
+    #[test]
+    fn side_effect_only_tail_still_reports_missing_return() {
+        let diags = check(r#"
+            fn f(x: i32) -> i32 {
+                let y = x + 1
+                println!("{}", y)
+            }
+
+            fn main() {
+                f(1)
+            }
+        "#);
+        assert!(
+            messages(&diags, DiagnosticKind::Warning).iter().any(|m| m.contains("may not return a value")),
+            "expected a missing-return warning, got {:?}",
+            messages(&diags, DiagnosticKind::Warning)
+        );
+    }
+
+    #[test]
+    fn closure_is_accepted_where_fn_pointer_is_expected() {
+        // Closures were typed as their return type, so passing one to a
+        // `fn(i32) -> i32` parameter failed with "has type 'i32'".
+        let diags = check(r#"
+            fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+                return f(x)
+            }
+
+            fn main() {
+                let closure = |x: i32| -> i32 { x * 2 }
+                println!("{}", apply(closure, 21))
+            }
+        "#);
+        assert!(messages(&diags, DiagnosticKind::Error).is_empty(), "{:?}", messages(&diags, DiagnosticKind::Error));
+    }
+
+    #[test]
+    fn owned_string_is_accepted_where_str_ref_is_expected() {
+        let diags = check(r#"
+            fn greet(name: &str) -> string {
+                return format!("Hi {}", name)
+            }
+
+            fn main() {
+                println!("{}", greet("World"))
+            }
+        "#);
+        assert!(messages(&diags, DiagnosticKind::Error).is_empty(), "{:?}", messages(&diags, DiagnosticKind::Error));
+    }
+
+    #[test]
+    fn non_string_still_rejected_where_str_ref_is_expected() {
+        let diags = check(r#"
+            fn greet(name: &str) -> string {
+                return format!("Hi {}", name)
+            }
+
+            fn main() {
+                println!("{}", greet(42))
+            }
+        "#);
+        assert!(
+            messages(&diags, DiagnosticKind::Error).iter().any(|m| m.contains("expected '&str'")),
+            "int argument should be rejected, got {:?}",
+            messages(&diags, DiagnosticKind::Error)
+        );
+    }
+}
