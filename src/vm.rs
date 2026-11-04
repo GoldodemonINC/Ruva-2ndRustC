@@ -128,6 +128,25 @@ fn apply_format_spec(value: &str, spec: Option<&str>) -> String {
     value.to_string()
 }
 
+/// Builds the text for a `println!`/`print!`/`format!` call from the values
+/// pushed for it: the first value is the format string when it contains a
+/// placeholder, otherwise every value is concatenated.
+fn build_formatted_string(values: &[Value]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    if values.len() == 1 {
+        return format!("{}", values[0]);
+    }
+    if let Value::Str(ref fmt) = values[0] {
+        if fmt.contains('{') {
+            let args: Vec<String> = values[1..].iter().map(|v| format!("{}", v)).collect();
+            return format_vm_string(fmt, &args);
+        }
+    }
+    values.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join("")
+}
+
 fn format_vm_string(fmt: &str, args: &[String]) -> String {
     let mut result = String::with_capacity(fmt.len());
     let mut chars = fmt.chars().peekable();
@@ -213,6 +232,9 @@ pub enum Opcode {
     GetField, SetField, NewObject,
     Print, Halt, PrintN,
     MakeClosure, GetUpvalue, SetUpvalue, GetUpvalueRef,
+    // Appended, never inserted: these discriminants are the bytecode encoding.
+    FormatN,
+    Fail,
 }
 
 impl Opcode {
@@ -236,6 +258,8 @@ impl Opcode {
             41=>Some(Self::Print),            42=>Some(Self::Halt),43=>Some(Self::PrintN),
             44=>Some(Self::MakeClosure),45=>Some(Self::GetUpvalue),46=>Some(Self::SetUpvalue),
             47=>Some(Self::GetUpvalueRef),
+            48=>Some(Self::FormatN),
+            49=>Some(Self::Fail),
             _=>None,
         }
     }
@@ -257,6 +281,13 @@ impl Chunk {
     pub fn emit_bytes(&mut self, op: Opcode, arg: u8, line: u32) { self.code.push(op as u8); self.code.push(arg); self.lines.push(line); self.lines.push(line); }
     pub fn emit_u16(&mut self, op: Opcode, val: u16, line: u32) { self.code.push(op as u8); self.code.push((val>>8) as u8); self.code.push(val as u8); self.lines.extend([line;3]); }
     pub fn emit_i16(&mut self, op: Opcode, val: i16, line: u32) { self.code.push(op as u8); self.code.push((val>>8) as u8); self.code.push(val as u8); self.lines.extend([line;3]); }
+    /// Emits an opcode followed by two `u16` operands (5 bytes total).
+    pub fn emit_u16_u16(&mut self, op: Opcode, a: u16, b: u16, line: u32) {
+        self.code.push(op as u8);
+        self.code.push((a>>8) as u8); self.code.push(a as u8);
+        self.code.push((b>>8) as u8); self.code.push(b as u8);
+        self.lines.extend([line;5]);
+    }
     pub fn emit_i64(&mut self, op: Opcode, val: i64, line: u32) {
         self.code.push(op as u8); self.lines.push(line);
         for b in val.to_be_bytes() { self.code.push(b); self.lines.push(line); }
@@ -317,6 +348,8 @@ impl Chunk {
             Some(Opcode::NewObject)=>{let n=self.read_u16(ip);let fc=self.read_u16(ip+2);eprintln!("  {:4}  NEW_OBJECT  \"{}\" fields={}",off,self.strings[n as usize],fc);ip+4}
             Some(Opcode::Print)=>{eprintln!("  {:4}  PRINT",off);ip}
             Some(Opcode::PrintN)=>{eprintln!("  {:4}  PRINTN      argc={}",off,self.code[ip]);ip+1}
+            Some(Opcode::FormatN)=>{eprintln!("  {:4}  FORMATN     argc={}",off,self.code[ip]);ip+1}
+            Some(Opcode::Fail)=>{eprintln!("  {:4}  FAIL",off);ip}
             Some(Opcode::MakeClosure)=>{eprintln!("  {:4}  MAKE_CLOSURE n={}",off,self.read_u16(ip));ip+2}
             Some(Opcode::GetUpvalue)=>{eprintln!("  {:4}  GET_UPVALUE {}",off,self.code[ip]);ip+1}
             Some(Opcode::SetUpvalue)=>{eprintln!("  {:4}  SET_UPVALUE {}",off,self.code[ip]);ip+1}
@@ -823,8 +856,11 @@ impl Compiler {
                 let ni = self.chunk.add_string(cn);
                 for (_, v) in fields { self.compile_expr(v, line)?; }
                 for (n, _) in fields { let i = self.chunk.add_string(n.clone()); self.chunk.emit_u16(Opcode::LoadStr, i, line); }
-                self.chunk.emit_u16(Opcode::NewObject, ni, line);
-                self.chunk.emit_u16(Opcode::LoadStr, fields.len() as u16, line);
+                // NewObject reads both operands (class name, field count). The
+                // old code emitted only the name and used a LoadStr opcode byte
+                // as the count, so every struct literal built an object whose
+                // fields had to be recovered from the wrong stack slots.
+                self.chunk.emit_u16_u16(Opcode::NewObject, ni, fields.len() as u16, line);
             }
             Expr::Reference { expr: inner, .. } | Expr::Deref(inner) | Expr::Cast { expr: inner, .. }
             | Expr::Move(inner) | Expr::Try(inner) => self.compile_expr(inner, line)?,
@@ -1117,6 +1153,60 @@ impl Compiler {
                 self.chunk.emit_bytes(Opcode::PrintN, args.len() as u8, line);
                 self.chunk.emit_byte(Opcode::Halt, line);
             }
+            // `format!` is `println!` that yields the string instead of
+            // printing it. Without this arm it fell through to a global
+            // function call on a nil value, so every non-literal argument
+            // died with `Cannot call <value>` at runtime.
+            "format" => {
+                for a in args { self.compile_expr(a, line)?; }
+                self.chunk.emit_bytes(Opcode::FormatN, args.len() as u8, line);
+            }
+            "vec" => {
+                for a in args { self.compile_expr(a, line)?; }
+                self.chunk.emit_u16(Opcode::MakeArray, args.len() as u16, line);
+            }
+            "assert" | "assert_eq" | "assert_ne" => {
+                match name {
+                    "assert" => {
+                        let cond = args.first().ok_or_else(|| CompileError(
+                            "assert! needs a condition".to_string()))?;
+                        self.compile_expr(cond, line)?;
+                    }
+                    _ => {
+                        let (a, b) = (args.get(0), args.get(1));
+                        match (a, b) {
+                            (Some(a), Some(b)) => {
+                                self.compile_expr(a, line)?;
+                                self.compile_expr(b, line)?;
+                                let op = if name == "assert_eq" { Opcode::Eq } else { Opcode::Ne };
+                                self.chunk.emit_byte(op, line);
+                            }
+                            _ => return Err(CompileError(
+                                format!("{}! needs two operands", name))),
+                        }
+                    }
+                }
+                // false -> print a message and stop; true -> skip that block.
+                let jf = self.chunk.code.len();
+                self.chunk.emit_i16(Opcode::JmpIfFalse, 0, line);
+                let jend = self.chunk.code.len();
+                self.chunk.emit_i16(Opcode::Jmp, 0, line);
+                let msg = self.chunk.add_string(format!("{}! failed", name));
+                self.chunk.emit_u16(Opcode::LoadStr, msg, line);
+                // A failed assertion is a runtime error, not a print-then-stop:
+                // exiting 0 would report a broken test as a pass.
+                self.chunk.emit_byte(Opcode::Fail, line);
+                let end = self.chunk.code.len();
+                // A false condition jumps to the message block that starts
+                // right after the unconditional jump, not past it.
+                let fail_off = (jend - jf) as i16;
+                self.chunk.code[jf + 1] = (fail_off >> 8) as u8;
+                self.chunk.code[jf + 2] = fail_off as u8;
+                let ok_off = (end - jend - 3) as i16;
+                self.chunk.code[jend + 1] = (ok_off >> 8) as u8;
+                self.chunk.code[jend + 2] = ok_off as u8;
+                self.chunk.emit_byte(Opcode::LoadNil, line);
+            }
             _ => {
                 let i = self.chunk.add_string(name.to_string());
                 self.chunk.emit_u16(Opcode::GetGlobal, i, line);
@@ -1158,6 +1248,16 @@ impl Vm {
     pub fn run(&mut self, chunk: &Chunk) -> Result<Value, String> {
         self.frames.push(Frame { ip: 0, slot: 0 });
         self.run_loop(chunk)
+    }
+
+    /// Pops `count` values off the stack in source order.
+    fn pop_values(&mut self, count: usize) -> Vec<Value> {
+        let mut values: Vec<Value> = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push(self.stack.pop().unwrap_or(Value::Nil));
+        }
+        values.reverse();
+        values
     }
 
     fn run_loop(&mut self, chunk: &Chunk) -> Result<Value, String> {
@@ -1459,27 +1559,22 @@ impl Vm {
                 }
                 Opcode::PrintN => {
                     let argc = code[ip] as usize; ip += 1;
-                    let mut values: Vec<Value> = Vec::with_capacity(argc);
-                    for _ in 0..argc {
-                        values.push(self.stack.pop().unwrap_or(Value::Nil));
-                    }
-                    values.reverse();
-                    let output = if argc == 0 {
-                        String::new()
-                    } else if argc == 1 {
-                        format!("{}", values[0])
-                    } else if let Value::Str(ref fmt) = values[0] {
-                        if fmt.contains('{') {
-                            let args: Vec<String> = values[1..].iter().map(|v| format!("{}", v)).collect();
-                            format_vm_string(fmt, &args)
-                        } else {
-                            values.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join("")
-                        }
-                    } else {
-                        values.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join("")
-                    };
-                    println!("{}", output);
+                    let values = self.pop_values(argc);
+                    println!("{}", build_formatted_string(&values));
                     self.stack.push(Value::Nil);
+                }
+                Opcode::FormatN => {
+                    let argc = code[ip] as usize; ip += 1;
+                    let values = self.pop_values(argc);
+                    let output = build_formatted_string(&values);
+                    self.stack.push(Value::Str(output));
+                }
+                Opcode::Fail => {
+                    let message = self.stack.pop().unwrap_or(Value::Nil);
+                    return Err(match message {
+                        Value::Str(s) => s,
+                        other => format!("{}", other),
+                    });
                 }
                 Opcode::Halt => { return Ok(self.stack.pop().unwrap_or(Value::Nil)); }
             }
@@ -1541,5 +1636,103 @@ mod format_tests {
     #[test]
     fn escaped_braces_are_literal() {
         assert_eq!(format_vm_string("{{}}", &args(&[])), "{}");
+    }
+}
+
+#[cfg(test)]
+mod macro_and_object_tests {
+    use super::*;
+    use crate::parser::Parser;
+
+    fn run(src: &str) -> Result<Value, String> {
+        let mut parser = Parser::new(src).unwrap();
+        let program = parser.parse_program().unwrap();
+        compile_and_run(&program, false)
+    }
+
+    /// Runs a program that checks itself with the language's own assertions.
+    fn runs_cleanly(src: &str) {
+        if let Err(e) = run(src) {
+            panic!("expected the program to pass its own assertions, got: {}", e);
+        }
+    }
+
+    fn run_err(src: &str) -> String {
+        match run(src) {
+            Ok(v) => panic!("expected an error, got value: {}", v),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn format_returns_the_string_instead_of_printing_it() {
+        runs_cleanly(r#"fn main() {
+            let s = format!("a={} b={}", 1, 2)
+            assert_eq!(s, "a=1 b=2")
+        }"#);
+    }
+
+    #[test]
+    fn format_accepts_non_literal_arguments() {
+        // The regression: `format!` with a variable fell through to a global
+        // call and died with "Cannot call Int(5)".
+        runs_cleanly(r#"fn main() {
+            let x = 5
+            assert_eq!(format!("v={}", x), "v=5")
+        }"#);
+        runs_cleanly(r#"fn greet(n: &str) -> string { return format!("Hi {}", n) }
+            fn main() { assert_eq!(greet("World"), "Hi World") }"#);
+    }
+
+    #[test]
+    fn format_supports_precision_specs() {
+        runs_cleanly(r#"fn main() { assert_eq!(format!("{:.2}", 3.14159), "3.14") }"#);
+    }
+
+    #[test]
+    fn vec_builds_an_array_from_its_arguments() {
+        runs_cleanly(r#"fn main() {
+            let nums = vec![1, 2, 3, 4, 5]
+            let sum = 0
+            for n in nums { sum = sum + n }
+            assert_eq!(sum, 15)
+        }"#);
+    }
+
+    #[test]
+    fn passing_assertions_do_not_fail() {
+        runs_cleanly(r#"fn main() { assert!(1 == 1) assert_eq!(2 + 2, 4) assert_ne!(1, 2) }"#);
+    }
+
+    #[test]
+    fn failing_assertions_are_runtime_errors() {
+        // A failed assertion used to print and halt with a success exit code.
+        assert_eq!(run_err(r#"fn main() { assert!(1 == 2) }"#), "assert! failed");
+        assert_eq!(run_err(r#"fn main() { assert_eq!(2 + 2, 5) }"#), "assert_eq! failed");
+        assert_eq!(run_err(r#"fn main() { assert_ne!(1, 1) }"#), "assert_ne! failed");
+    }
+
+    #[test]
+    fn struct_literal_fields_hold_their_values() {
+        // Every field used to come back as nil, so `p.x + p.y` was nil.
+        runs_cleanly(r#"struct P { x: i32, y: i32 }
+            fn main() {
+                let p = P { x: 3, y: 4 }
+                assert_eq!(p.x + p.y, 7)
+            }"#);
+    }
+
+    #[test]
+    fn opcode_numbers_are_stable() {
+        // These bytes are the interpreter encoding. Inserting a variant in the
+        // middle of the enum renumbered every later opcode and silently turned
+        // a format into a closure creation.
+        assert_eq!(Opcode::PrintN as u8, 43);
+        assert_eq!(Opcode::MakeClosure as u8, 44);
+        assert_eq!(Opcode::GetUpvalueRef as u8, 47);
+        assert_eq!(Opcode::FormatN as u8, 48);
+        assert_eq!(Opcode::Fail as u8, 49);
+        assert!(matches!(Opcode::from_u8(48), Some(Opcode::FormatN)));
+        assert!(matches!(Opcode::from_u8(49), Some(Opcode::Fail)));
     }
 }
