@@ -270,7 +270,14 @@ impl Parser {
         self.expect(&Token::Hash)?;
         self.expect(&Token::LBracket)?;
 
-        let (name, _) = self.expect_ident()?;
+        // `test` is lexed as its own token, so `#[test]` never reached
+        // expect_ident and failed with "Expected identifier, got Test".
+        let name = if self.at(&Token::Test) {
+            self.advance();
+            "test".to_string()
+        } else {
+            self.expect_ident()?.0
+        };
 
         let mut args = Vec::new();
         if self.at(&Token::LParen) {
@@ -441,6 +448,11 @@ impl Parser {
             } else {
                 false
             };
+
+            // Fields may be written `pub let id: u64`, which is how the
+            // generated examples declare them.
+            if self.at(&Token::Let) { self.advance(); }
+            if self.at(&Token::Mut) { self.advance(); }
 
             let (field_name, _) = self.expect_ident()?;
             self.expect(&Token::Colon)?;
@@ -1205,6 +1217,7 @@ impl Parser {
     fn parse_stmt(&mut self) -> Result<Stmt> {
         match self.peek() {
             Token::Let => self.parse_let_stmt(),
+            Token::Const => self.parse_const_stmt(),
             Token::Return => self.parse_return_stmt(),
             Token::If => self.parse_if_stmt(),
             Token::For => self.parse_for_stmt(),
@@ -1285,6 +1298,26 @@ impl Parser {
                 }
             }
         }
+    }
+
+    /// `const NAME: Type = value` in statement position. `const` was only
+    /// understood inside `extern` blocks, so every example that declared an
+    /// in-function constant failed to parse with "Unexpected token Const in
+    /// expression". A constant is an immutable binding here; the toolchain does
+    /// not require its initializer to be a compile-time constant.
+    fn parse_const_stmt(&mut self) -> Result<Stmt> {
+        self.expect(&Token::Const)?;
+        let pattern = self.parse_pattern()?;
+        let ty = if self.at(&Token::Colon) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&Token::Eq)?;
+        let value = self.parse_expr()?;
+        if self.at(&Token::Semicolon) { self.advance(); }
+        Ok(Stmt::Let { pattern, ty, is_mut: false, value })
     }
 
     fn parse_let_stmt(&mut self) -> Result<Stmt> {
@@ -2903,3 +2936,70 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod declaration_parsing_tests {
+    use super::*;
+
+    fn program(src: &str) -> Program {
+        let mut parser = Parser::new(src).unwrap();
+        parser.parse_program().unwrap()
+    }
+
+    #[test]
+    fn const_in_a_function_body_binds_an_immutable_local() {
+        // `const` was only understood inside `extern` blocks, so every example
+        // that declared an in-function constant failed to parse.
+        let p = program(r#"
+            fn main() {
+                const MAX_VALUE: i64 = 999999
+                let x = MAX_VALUE
+            }
+        "#);
+        let body = match &p.items[0] {
+            Item::Function(f) => &f.body,
+            other => panic!("expected a function, got {:?}", other),
+        };
+        match &body.stmts[0] {
+            Stmt::Let { ty, is_mut, .. } => {
+                assert!(!*is_mut, "a const binding must not be mutable");
+                assert!(ty.is_some(), "the declared type should be kept");
+            }
+            other => panic!("expected a let binding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_fields_accept_visibility_and_let() {
+        // The generated examples write `pub let id: u64`.
+        let p = program(r#"
+            pub struct Switch {
+                pub let id: u64,
+                pub let mut value: i64,
+                name: string,
+            }
+        "#);
+        match &p.items[0] {
+            Item::Struct(s) => assert_eq!(s.fields.len(), 3, "expected three fields"),
+            other => panic!("expected a struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_attribute_parses_as_an_attribute() {
+        // `test` is lexed as a keyword token, so `#[test]` never reached
+        // expect_ident.
+        let p = program(r#"
+            #[test]
+            fn test_something() {
+                assert!(1 == 1)
+            }
+        "#);
+        match &p.items[0] {
+            Item::Attribute(a) => {
+                assert_eq!(a.name, "test");
+                assert!(matches!(*a.item, Item::Function(_)));
+            }
+            other => panic!("expected an attribute item, got {:?}", other),
+        }
+    }
+}
