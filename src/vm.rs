@@ -136,6 +136,13 @@ fn build_formatted_string(values: &[Value]) -> String {
         return String::new();
     }
     if values.len() == 1 {
+        // A lone string still needs brace unescaping, so `format!("{{}}")`
+        // yields `{}` rather than the literal `{{}}`.
+        if let Value::Str(ref s) = values[0] {
+            if s.contains("{") {
+                return format_vm_string(s, &[]);
+            }
+        }
         return format!("{}", values[0]);
     }
     if let Value::Str(ref fmt) = values[0] {
@@ -235,6 +242,7 @@ pub enum Opcode {
     // Appended, never inserted: these discriminants are the bytecode encoding.
     FormatN,
     Fail,
+    RepeatArray,
 }
 
 impl Opcode {
@@ -260,6 +268,7 @@ impl Opcode {
             47=>Some(Self::GetUpvalueRef),
             48=>Some(Self::FormatN),
             49=>Some(Self::Fail),
+            50=>Some(Self::RepeatArray),
             _=>None,
         }
     }
@@ -350,6 +359,7 @@ impl Chunk {
             Some(Opcode::PrintN)=>{eprintln!("  {:4}  PRINTN      argc={}",off,self.code[ip]);ip+1}
             Some(Opcode::FormatN)=>{eprintln!("  {:4}  FORMATN     argc={}",off,self.code[ip]);ip+1}
             Some(Opcode::Fail)=>{eprintln!("  {:4}  FAIL",off);ip}
+            Some(Opcode::RepeatArray)=>{eprintln!("  {:4}  REPEAT_ARRAY",off);ip}
             Some(Opcode::MakeClosure)=>{eprintln!("  {:4}  MAKE_CLOSURE n={}",off,self.read_u16(ip));ip+2}
             Some(Opcode::GetUpvalue)=>{eprintln!("  {:4}  GET_UPVALUE {}",off,self.code[ip]);ip+1}
             Some(Opcode::SetUpvalue)=>{eprintln!("  {:4}  SET_UPVALUE {}",off,self.code[ip]);ip+1}
@@ -850,7 +860,7 @@ impl Compiler {
                 self.scope_depth -= 1;
                 self.retain_locals(self.scope_depth);
             }
-            Expr::Macro { name, args, separator: _ } => self.compile_macro(name, args, line)?,
+            Expr::Macro { name, args, separator } => self.compile_macro(name, args, *separator, line)?,
             Expr::StructLiteral { name, fields } => {
                 let cn = match name.as_ref() { Expr::Ident(n) => n.clone(), Expr::Path(p) => p.join("::"), _ => "Object".into() };
                 let ni = self.chunk.add_string(cn);
@@ -1141,7 +1151,7 @@ impl Compiler {
     }
 
 
-    fn compile_macro(&mut self, name: &str, args: &[Expr], line: u32) -> Result<(), CompileError> {
+    fn compile_macro(&mut self, name: &str, args: &[Expr], separator: char, line: u32) -> Result<(), CompileError> {
         match name {
             "println" | "print" => {
                 for a in args { self.compile_expr(a, line)?; }
@@ -1158,12 +1168,24 @@ impl Compiler {
             // function call on a nil value, so every non-literal argument
             // died with `Cannot call <value>` at runtime.
             "format" => {
+                if args.len() > u8::MAX as usize {
+                    return Err(CompileError(format!(
+                        "format! accepts at most {} arguments, got {}",
+                        u8::MAX, args.len())));
+                }
                 for a in args { self.compile_expr(a, line)?; }
                 self.chunk.emit_bytes(Opcode::FormatN, args.len() as u8, line);
             }
             "vec" => {
-                for a in args { self.compile_expr(a, line)?; }
-                self.chunk.emit_u16(Opcode::MakeArray, args.len() as u16, line);
+                if separator == ';' && args.len() == 2 {
+                    // `vec![value; count]` repeats the value `count` times.
+                    self.compile_expr(&args[0], line)?;
+                    self.compile_expr(&args[1], line)?;
+                    self.chunk.emit_byte(Opcode::RepeatArray, line);
+                } else {
+                    for a in args { self.compile_expr(a, line)?; }
+                    self.chunk.emit_u16(Opcode::MakeArray, args.len() as u16, line);
+                }
             }
             "assert" | "assert_eq" | "assert_ne" => {
                 match name {
@@ -1186,13 +1208,22 @@ impl Compiler {
                         }
                     }
                 }
-                // false -> print a message and stop; true -> skip that block.
+                // false -> fail; true -> drop the condition and continue.
+                // JmpIfFalse peeks at the stack, so the passing path has to pop.
                 let jf = self.chunk.code.len();
                 self.chunk.emit_i16(Opcode::JmpIfFalse, 0, line);
+                self.chunk.emit_byte(Opcode::Pop, line);
                 let jend = self.chunk.code.len();
                 self.chunk.emit_i16(Opcode::Jmp, 0, line);
-                let msg = self.chunk.add_string(format!("{}! failed", name));
-                self.chunk.emit_u16(Opcode::LoadStr, msg, line);
+                // `assert!(cond, "why")` reports its message; without one, the
+                // macro name is the message.
+                match args.get(if name == "assert" { 1 } else { 2 }) {
+                    Some(message) => self.compile_expr(message, line)?,
+                    None => {
+                        let msg = self.chunk.add_string(format!("{}! failed", name));
+                        self.chunk.emit_u16(Opcode::LoadStr, msg, line);
+                    }
+                }
                 // A failed assertion is a runtime error, not a print-then-stop:
                 // exiting 0 would report a broken test as a pass.
                 self.chunk.emit_byte(Opcode::Fail, line);
@@ -1576,6 +1607,18 @@ impl Vm {
                         other => format!("{}", other),
                     });
                 }
+                Opcode::RepeatArray => {
+                    let count = match self.stack.pop().unwrap_or(Value::Nil) {
+                        Value::Int(n) if n >= 0 => n as usize,
+                        Value::Int(n) => return Err(format!("vec![elem; n] needs a non-negative count, got {}", n)),
+                        other => return Err(format!("vec![elem; n] needs an integer count, got {}", other)),
+                    };
+                    let value = self.stack.pop().unwrap_or(Value::Nil);
+                    if count > MAX_STRING_ALLOC {
+                        return Err(format!("vec![elem; {}] is too large", count));
+                    }
+                    self.stack.push(Value::Array(vec![value; count]));
+                }
                 Opcode::Halt => { return Ok(self.stack.pop().unwrap_or(Value::Nil)); }
             }
         }
@@ -1734,5 +1777,57 @@ mod macro_and_object_tests {
         assert_eq!(Opcode::Fail as u8, 49);
         assert!(matches!(Opcode::from_u8(48), Some(Opcode::FormatN)));
         assert!(matches!(Opcode::from_u8(49), Some(Opcode::Fail)));
+    }
+
+    #[test]
+    fn vec_repeat_builds_count_copies() {
+        // `vec![value; count]` used to compile the two operands as elements,
+        // so vec![7; 3] produced [7, 3].
+        runs_cleanly(r#"
+            fn main() {
+                let v = vec![7; 3]
+                assert_eq!(v[0], 7)
+                assert_eq!(v[1], 7)
+                assert_eq!(v[2], 7)
+            }
+        "#);
+    }
+
+    #[test]
+    fn a_single_argument_format_still_unescapes_braces() {
+        runs_cleanly(r#"
+            fn main() {
+                assert_eq!(format!("{{}}"), "{}")
+            }
+        "#);
+    }
+
+    #[test]
+    fn a_failed_assertion_reports_its_message() {
+        let err = run_err(r#"
+            fn main() {
+                assert_eq!(1, 2, "one is not two")
+            }
+        "#);
+        assert!(err.contains("one is not two"), "expected the message, got: {}", err);
+    }
+
+    #[test]
+    fn a_passing_assertion_leaves_nothing_on_the_stack() {
+        // JmpIfFalse only peeks, so the passing path has to pop the condition.
+        runs_cleanly(r#"
+            fn main() {
+                assert!(1 == 1)
+                assert!(2 > 1)
+                assert_eq!(1 + 1, 2)
+                assert_eq!(1 + 1 + 1, 3)
+                assert_eq!(1 + 1 + 1 + 1, 4)
+                assert_eq!(1 + 1 + 1 + 1 + 1, 5)
+                assert_eq!(1 + 1 + 1 + 1 + 1 + 1, 6)
+                assert_eq!(1 + 1 + 1 + 1 + 1 + 1 + 1, 7)
+                assert_eq!(1 + 1 + 1 + 1 + 1 + 1 + 1 + 1, 8)
+                assert_eq!(1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1, 9)
+            }
+        "#);
     }
 }

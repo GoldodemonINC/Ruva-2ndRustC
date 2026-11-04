@@ -65,6 +65,8 @@ pub struct TypeChecker {
     /// also registered as bindings so name resolution sees them, but they are
     /// types, so "never used" variable warnings must skip them.
     type_names: std::collections::HashSet<String>,
+    /// Variant names per enum, used to tell whether a `match` covers every case.
+    enum_variants: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -117,6 +119,7 @@ impl TypeChecker {
             type_var_values: std::collections::HashMap::new(),
             next_type_var: 0,
             type_names: std::collections::HashSet::new(),
+            enum_variants: std::collections::HashMap::new(),
         };
 
         for b in &["Some", "None", "Ok", "Err", "Self"] {
@@ -169,6 +172,9 @@ impl TypeChecker {
                 }).collect();
                 let ret_type = f.return_type.as_ref().map(|t| self.ast_type_to_ty_with_generics(t, &generic_map));
                 self.functions.insert(f.name.clone(), FunctionSig { params, return_type: ret_type, generic_params });
+                // A function that shares a type's name owns the binding, so it
+                // must not be hidden from the unused-binding warning.
+                self.type_names.remove(&f.name);
                 self.define_var(f.name.clone(), Ty::Named(f.name.clone()), false, f.span.line);
             }
             Item::Class(c) => {
@@ -197,6 +203,10 @@ impl TypeChecker {
             }
             Item::Enum(e) => {
                 self.type_names.insert(e.name.clone());
+                self.enum_variants.insert(
+                    e.name.clone(),
+                    e.variants.iter().map(|v| v.name.clone()).collect(),
+                );
                 self.define_var(e.name.clone(), Ty::Named(e.name.clone()), false, e.span.line);
 
                 for v in &e.variants {
@@ -396,6 +406,27 @@ impl TypeChecker {
 
         self.check_block(&f.body);
 
+        // A tail expression is the function's value, so it has to match the
+        // declared return type. Without this, `fn f() -> i32 { "wrong" }`
+        // checked clean once tails stopped warning about missing returns.
+        if let (Some(declared), Some(tail)) =
+            (self.current_return_type.clone(), f.body.expr.as_ref())
+        {
+            if !self.ty_is_unit(&declared) && self.expr_yields_value(tail) {
+                let actual = self.infer_type(tail);
+                if !self.ty_is_inferred(&actual) && !self.types_compatible(&declared, &actual) {
+                    self.error(
+                        format!(
+                            "Function '{}' returns '{}', expected '{}'",
+                            f.name,
+                            self.ty_to_string(&actual),
+                            self.ty_to_string(&declared)
+                        ),
+                        f.span.line, 0,
+                    );
+                }
+            }
+        }
 
         if let Some(ref ret_ty) = self.current_return_type {
             if !self.ty_is_unit(ret_ty) && !self.block_has_return(&f.body) {
@@ -430,21 +461,74 @@ impl TypeChecker {
                     }
                 }
             }
-            // `match` yields a value when every arm does, so a match that
-            // covers all cases returns the arm's value.
-            if let Stmt::Match { arms, .. } = stmt {
-                if !arms.is_empty() && arms.iter().all(|arm| self.expr_yields_value(&arm.body)) {
+            // A `match` yields a value when every arm does, but only a
+            // catch-all arm guarantees one runs for every input.
+            if let Stmt::Match { expr, arms } = stmt {
+                if self.match_yields_a_value(expr, arms) {
                     return true;
                 }
             }
             // A `match` in statement position can also be wrapped in Expr.
-            if let Stmt::Expr(Expr::Match { arms, .. }) = stmt {
-                if !arms.is_empty() && arms.iter().all(|arm| self.expr_yields_value(&arm.body)) {
+            if let Stmt::Expr(Expr::Match { expr, arms }) = stmt {
+                if self.match_yields_a_value(expr, arms) {
                     return true;
                 }
             }
         }
         false
+    }
+
+    /// Whether a `match` always produces a value: every arm must yield one and
+    /// at least one arm must catch every remaining input, otherwise control can
+    /// fall out of the `match` without a value.
+    fn match_yields_a_value(&self, scrutinee: &Expr, arms: &[MatchArm]) -> bool {
+        if arms.is_empty() || !arms.iter().all(|arm| self.expr_yields_value(&arm.body)) {
+            return false;
+        }
+        if arms
+            .iter()
+            .any(|arm| matches!(arm.pattern, Pattern::Wildcard | Pattern::Ident(_)))
+        {
+            return true;
+        }
+        // Without a catch-all, only a match over every enum variant is total.
+        match self.enum_variants_for(scrutinee) {
+            Some(variants) => {
+                let covered: std::collections::HashSet<&str> = arms
+                    .iter()
+                    .filter_map(|arm| match &arm.pattern {
+                        Pattern::Enum { path, .. } => path.last().map(|s| s.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                variants.iter().all(|v| covered.contains(v.as_str()))
+            }
+            None => false,
+        }
+    }
+
+    /// The enum variants behind a `match` scrutinee, when it is a local binding
+    /// with an enum type.
+    fn enum_variants_for(&self, scrutinee: &Expr) -> Option<&Vec<String>> {
+        let name = match scrutinee {
+            Expr::Ident(n) => {
+                let ty = self
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find_map(|s| s.bindings.get(n).map(|(t, _, _)| t.clone()))?;
+                match ty {
+                    Ty::Named(n) | Ty::Generic(n, _) => n,
+                    Ty::Reference(inner, _) => match *inner {
+                        Ty::Named(n) | Ty::Generic(n, _) => n,
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        self.enum_variants.get(&name)
     }
 
     /// Whether an expression produces a value (as opposed to only side effects).
@@ -458,7 +542,8 @@ impl TypeChecker {
             },
             // `println!`-style macros and functions declared without a return
             // type are unit-valued, so they do not satisfy a typed return.
-            Expr::Macro { .. } => false,
+            // `format!` and `vec!` do produce values.
+            Expr::Macro { name, .. } => matches!(name.as_str(), "format" | "vec"),
             Expr::Call { function, .. } => match &**function {
                 Expr::Ident(name) => self
                     .functions
@@ -1398,8 +1483,9 @@ impl TypeChecker {
             Ty::Primitive(s) | Ty::Named(s) => s == "string" || s == "String",
             _ => false,
         };
+        // Only immutable references: an owned string cannot satisfy `&mut str`.
         let is_str_ref = |t: &Ty| match t {
-            Ty::Reference(inner, _) => is_str_ty(inner),
+            Ty::Reference(inner, is_mut) => !*is_mut && is_str_ty(inner),
             _ => false,
         };
         if (is_owned_str(&a) && is_str_ref(&b)) || (is_str_ref(&a) && is_owned_str(&b)) {
@@ -2224,6 +2310,89 @@ mod diagnostics_regression_tests {
             messages(&diags, DiagnosticKind::Error).iter().any(|m| m.contains("expected '&str'")),
             "int argument should be rejected, got {:?}",
             messages(&diags, DiagnosticKind::Error)
+        );
+    }
+
+    #[test]
+    fn a_tail_expression_is_checked_against_the_declared_return_type() {
+        // Tails stopped warning about missing returns, so the mismatch has to
+        // be reported here or `fn f() -> i32 { "wrong" }` checks clean.
+        let diags = check(r#"
+            fn f() -> i32 {
+                "wrong"
+            }
+        "#);
+        let errors = messages(&diags, DiagnosticKind::Error);
+        assert!(
+            errors.iter().any(|m| m.contains("returns 'string', expected 'i32'")),
+            "expected a return type mismatch, got {:?}", errors
+        );
+    }
+
+    #[test]
+    fn a_format_macro_tail_satisfies_a_string_return() {
+        let diags = check(r#"
+            fn f(n: i64) -> string {
+                format!("n = {}", n)
+            }
+        "#);
+        let warnings = messages(&diags, DiagnosticKind::Warning);
+        assert!(
+            !warnings.iter().any(|m| m.contains("may not return a value")),
+            "expected no missing-return warning, got {:?}", warnings
+        );
+    }
+
+    #[test]
+    fn a_match_without_a_catch_all_arm_does_not_satisfy_a_typed_return() {
+        let diags = check(r#"
+            enum E { A, B }
+
+            fn f(x: E) -> i32 {
+                match x {
+                    E::A => 1,
+                }
+            }
+        "#);
+        assert!(
+            messages(&diags, DiagnosticKind::Warning)
+                .iter()
+                .any(|m| m.contains("may not return a value")),
+            "a non-exhaustive match can fall through without a value"
+        );
+    }
+
+    #[test]
+    fn a_match_over_every_variant_satisfies_a_typed_return() {
+        let diags = check(r#"
+            enum E { A, B }
+
+            fn f(x: E) -> i32 {
+                match x {
+                    E::A => 1,
+                    E::B => 2,
+                }
+            }
+        "#);
+        let warnings = messages(&diags, DiagnosticKind::Warning);
+        assert!(
+            !warnings.iter().any(|m| m.contains("may not return a value")),
+            "expected no missing-return warning, got {:?}", warnings
+        );
+    }
+
+    #[test]
+    fn an_owned_string_does_not_satisfy_a_mutable_str_reference() {
+        let diags = check(r#"
+            fn take(s: &mut str) {}
+
+            fn forward(s: string) {
+                take(s)
+            }
+        "#);
+        assert!(
+            !messages(&diags, DiagnosticKind::Error).is_empty(),
+            "a `string` cannot be passed to a `&mut str` parameter"
         );
     }
 }
