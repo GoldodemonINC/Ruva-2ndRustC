@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main, feat/*]
+  # Any base branch: stacked PRs target each other, not main, and a PR that
+  # skips CI is worse than one that reports a known failure.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
